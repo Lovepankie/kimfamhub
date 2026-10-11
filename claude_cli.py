@@ -22,3 +22,47 @@ def usable(text):
     """-> the stripped text when it is a real answer, else ''."""
     t = (text or "").strip()
     return "" if (not t or is_notice(t)) else t
+
+
+def tokens(env=None):
+    """OAuth tokens to try, in order: the main account, then the backup (CLAUDE_CODE_OAUTH_TOKEN_2). Values, never logged."""
+    import os
+    env = os.environ if env is None else env
+    out = []
+    for k in ("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN_2"):
+        v = (env.get(k) or "").strip()
+        if v and v not in out:
+            out.append(v)
+    return out or [None]          # None: no token configured, use whatever the CLI is logged in as
+
+
+def complete(prompt, model="haiku", timeout=120, env=None, runner=None):
+    """One Claude CLI completion that falls over to the backup account. A limit or login notice on one account counts as a
+    failure and the next account is tried; '' when every account fails (the caller then goes to DeepSeek or Groq).
+    `runner(args, env, timeout) -> (returncode, stdout)` is injectable for tests. Blocking: async callers use
+    asyncio.to_thread."""
+    import os
+    import subprocess
+    import logging
+
+    def _run(args, e, t):
+        r = subprocess.run(args, capture_output=True, text=True, timeout=t, env=e)
+        return r.returncode, r.stdout
+
+    run = runner or _run
+    base = dict(os.environ if env is None else env)
+    base["HOME"] = "/root"
+    for i, tok in enumerate(tokens(base)):
+        e = dict(base)
+        if tok:
+            e["CLAUDE_CODE_OAUTH_TOKEN"] = tok
+        try:
+            rc, out = run(["claude", "-p", prompt, "--model", model], e, timeout)
+        except Exception as ex:
+            logging.getLogger("main").warning("claude CLI account %d failed: %s", i + 1, type(ex).__name__)
+            continue
+        ans = usable(out)
+        if rc == 0 and ans:
+            return ans
+        logging.getLogger("main").warning("claude CLI account %d gave no usable answer (rc=%s): %.80s", i + 1, rc, (out or "").strip())
+    return ""

@@ -697,16 +697,8 @@ async def _ai_complete(prompt: str, claude_timeout: int = 150) -> str:
     raw = ""
     if len(prompt) <= 24000:
         try:
-            env = dict(_os.environ); env["HOME"] = "/root"
-            proc = await _aio.create_subprocess_exec(
-                "claude", "-p", prompt, "--model", "haiku",
-                stdout=_aio.subprocess.PIPE, stderr=_aio.subprocess.DEVNULL, env=env)
-            stdout, _ = await _aio.wait_for(proc.communicate(), timeout=claude_timeout)
-            if proc.returncode == 0:
-                import claude_cli as _cc
-                raw = _cc.usable(stdout.decode())
-                if not raw:
-                    _lg_ai.getLogger("main").warning("claude CLI gave no usable answer (limit or login notice?): %s", stdout.decode()[:120])
+            import claude_cli as _cc          # main account, then the backup account, then DeepSeek and Groq below
+            raw = await _aio.to_thread(_cc.complete, prompt, "haiku", claude_timeout)
         except Exception:
             pass
     if not raw:
@@ -2115,18 +2107,11 @@ Keep "decisions" in the SAME per-group shape shown in CURRENT MINUTES above."""
 
         raw = ""
         try:
-            env = dict(_os.environ); env["HOME"] = "/root"
-            proc = await _aio.create_subprocess_exec(
-                "claude", "-p", prompt, "--model", "sonnet",
-                stdout=_aio.subprocess.PIPE, stderr=_aio.subprocess.DEVNULL, env=env,
-            )
             # 600s: re-emitting a full multi-section narrative over a noisy transcript is
             # slow (same reason the assembly needs 900s); 280s was too tight and returned
             # empty -> the friendly "couldn't apply" message even on a valid instruction.
-            stdout, _ = await _aio.wait_for(proc.communicate(), timeout=600)
-            if proc.returncode == 0:
-                import claude_cli as _cc
-                raw = _cc.usable(stdout.decode())
+            import claude_cli as _cc
+            raw = await _aio.to_thread(_cc.complete, prompt, "sonnet", 600)
         except Exception:
             pass
 
@@ -8592,21 +8577,13 @@ def ai_unavailable_reason() -> str:
 
 def _ask_claude(prompt: str, model: str = "sonnet", timeout: int = 120) -> str:
     """Call the Claude Code CLI. Returns response text, or "" on failure (logged + recorded)."""
-    import subprocess as _sp, os as _os
-    env = dict(_os.environ); env["HOME"] = "/root"
+    import claude_cli as _cc
     try:
-        r = _sp.run(
-            ["claude", "-p", prompt, "--model", model],
-            capture_output=True, text=True, timeout=timeout, env=env
-        )
-        import claude_cli as _cc
-        if r.returncode == 0 and _cc.usable(r.stdout):
+        out = _cc.complete(prompt, model, timeout)       # main account, then the backup account
+        if out:
             _ai_ok()
-            return _cc.usable(r.stdout)
-        _ai_failed("rc=%s %s" % (r.returncode, (r.stderr or r.stdout or "")[-300:]))
-        return ""
-    except _sp.TimeoutExpired:
-        _ai_failed("timed out after %ss" % timeout)
+            return out
+        _ai_failed("no usable answer from any Claude account (limit, login or timeout)")
         return ""
     except Exception as e:
         _ai_failed(repr(e))
@@ -8616,29 +8593,17 @@ def _ask_claude(prompt: str, model: str = "sonnet", timeout: int = 120) -> str:
 
 async def _ask_claude_async(prompt: str, model: str = "haiku", timeout: int = 40) -> str:
     """Non-blocking Claude CLI call using asyncio subprocess."""
-    import asyncio as _aio, os as _os
-    env = dict(_os.environ); env["HOME"] = "/root"
-    proc = None
+    import asyncio as _aio
+    import claude_cli as _cc
     try:
-        proc = await _aio.create_subprocess_exec(
-            "claude", "-p", prompt, "--model", model,
-            stdout=_aio.subprocess.PIPE,
-            stderr=_aio.subprocess.PIPE,
-            env=env
-        )
-        stdout, stderr = await _aio.wait_for(proc.communicate(), timeout=timeout)
-        import claude_cli as _cc
-        out = _cc.usable(stdout.decode())
-        if proc.returncode == 0 and out:
+        out = await _aio.to_thread(_cc.complete, prompt, model, timeout)   # main account, then the backup account
+        if out:
             _ai_ok()
             return out
-        _ai_failed("rc=%s %s" % (proc.returncode, (stderr.decode() or out)[-300:]))
+        _ai_failed("no usable answer from any Claude account (limit, login or timeout)")
         return ""
     except Exception as e:
-        _ai_failed("timed out after %ss" % timeout if isinstance(e, _aio.TimeoutError) else repr(e))
-        if proc:
-            try: proc.kill()
-            except: pass
+        _ai_failed(repr(e))
         return ""
 
 @app.get("/api/projects/{project_id}/audit")

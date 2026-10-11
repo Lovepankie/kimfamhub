@@ -189,15 +189,11 @@ def _chat(prompt: str, max_tokens: int = 1024) -> str:
 
     # Claude primary (Claude Code CLI, authenticated on this server)
     try:
-        env = dict(os.environ); env["HOME"] = "/root"
-        r = subprocess.run(
-            ["claude", "-p", fit_prompt(prompt, 100000), "--model", "sonnet"],
-            capture_output=True, text=True, timeout=90, env=env
-        )
         import claude_cli
-        if r.returncode == 0 and claude_cli.usable(r.stdout):
-            return claude_cli.usable(r.stdout)
-        last_err = r.stderr[:200] if r.stderr else "claude returned empty or a limit notice"
+        ans = claude_cli.complete(fit_prompt(prompt, 100000), "sonnet", 90)   # main account, then the backup account
+        if ans:
+            return ans
+        last_err = "claude returned empty or a limit notice on every account"
     except Exception as e:
         last_err = e
 

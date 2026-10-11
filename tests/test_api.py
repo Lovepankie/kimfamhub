@@ -2909,4 +2909,39 @@ class TestClaudeLimitNoticeIsNotAnAnswer:
             src = open(os.path.join(_APP_ROOT, f)).read()
             assert "claude_cli" in src, f
         m = open(os.path.join(_APP_ROOT, "main.py")).read()
-        assert m.count("_cc.usable(") >= 5
+        assert m.count("_cc.complete") >= 4 and 'create_subprocess_exec(\n                "claude"' not in m
+
+
+class TestClaudeBackupAccount:
+    def test_second_account_is_tried_when_the_first_is_limited(self):
+        import claude_cli as c
+        seen = []
+
+        def runner(args, env, timeout):
+            seen.append(env["CLAUDE_CODE_OAUTH_TOKEN"])
+            if env["CLAUDE_CODE_OAUTH_TOKEN"] == "main":
+                return 0, "You've hit your weekly limit \u00b7 resets 5am (UTC)"
+            return 0, '{"ok": true}'
+        env = {"CLAUDE_CODE_OAUTH_TOKEN": "main", "CLAUDE_CODE_OAUTH_TOKEN_2": "backup"}
+        assert c.complete("p", "haiku", 5, env=env, runner=runner) == '{"ok": true}'
+        assert seen == ["main", "backup"]
+
+    def test_all_accounts_limited_returns_empty_so_deepseek_runs(self):
+        import claude_cli as c
+        env = {"CLAUDE_CODE_OAUTH_TOKEN": "a", "CLAUDE_CODE_OAUTH_TOKEN_2": "b"}
+        assert c.complete("p", env=env, runner=lambda a, e, t: (0, "Not logged in")) == ""
+        assert c.complete("p", env=env, runner=lambda a, e, t: (1, "boom")) == ""
+
+    def test_main_account_answer_never_touches_the_backup(self):
+        import claude_cli as c
+        seen = []
+        env = {"CLAUDE_CODE_OAUTH_TOKEN": "a", "CLAUDE_CODE_OAUTH_TOKEN_2": "b"}
+        assert c.complete("p", env=env, runner=lambda a, e, t: (seen.append(e["CLAUDE_CODE_OAUTH_TOKEN"]) or 0, "fine")) == "fine"
+        assert seen == ["a"]
+
+    def test_tokens_are_never_logged_and_missing_backup_is_fine(self):
+        import claude_cli as c
+        src = open(os.path.join(_APP_ROOT, "claude_cli.py")).read()
+        assert "log" in src and "tok)" not in src.split("def complete")[1].replace("if tok:", "")
+        assert c.tokens({"CLAUDE_CODE_OAUTH_TOKEN": "a"}) == ["a"] and c.tokens({}) == [None]
+        assert c.tokens({"CLAUDE_CODE_OAUTH_TOKEN": "a", "CLAUDE_CODE_OAUTH_TOKEN_2": "a"}) == ["a"]

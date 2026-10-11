@@ -94,17 +94,9 @@ def _via_deepseek(prompt):
 
 
 def _via_haiku(prompt):
-    import subprocess
-    env = dict(os.environ)
-    env.setdefault("HOME", "/root")
     try:
-        out = subprocess.run(
-            ["claude", "-p", prompt, "--model", "haiku"],
-            capture_output=True, timeout=60, env=env,
-        )
-        if out.returncode == 0:
-            import claude_cli
-            return claude_cli.usable(out.stdout.decode())
+        import claude_cli
+        return claude_cli.complete(prompt, "haiku", 60)       # main account, then the backup account
     except Exception as e:
         log.warning("haiku error: %s", e)
     return ""
