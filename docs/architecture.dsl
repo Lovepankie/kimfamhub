@@ -36,13 +36,13 @@ workspace {
             sqlite= container "SQLite stores" "auth (kimfam.db), washing_bay.db income" "SQLite"
         }
 
-        ci          = softwareSystem "GitHub Actions" "CI/CD: push to any branch deploys staging; main promotes to prod after green tests + Claude self-heal" "External"
+        ci          = softwareSystem "GitHub Actions" "CI/CD (repo RincolTech-Solutions-ltd/kimfamhub since ADR-036): push to any branch deploys staging; main promotes to prod after green tests + Claude self-heal" "External"
         designLoop  = softwareSystem "Design Review Loop" "tools/design-loop: Playwright screenshots staging, Gemini critiques vs design-system.md" "External"
         kimfamSheet  = softwareSystem "KimFam Financials Sheet" "Meeting Register, Action Tracker, financial ledger - managed by Hillary/Hellen on the main KimFam Google Sheet" "External"
         solomonSheet = softwareSystem "Solomon's AppSheet" "Chicken project P&L - Solomon's operational records (flock counts, expenses, revenue) entered via AppSheet mobile app, stored in a separate Google Sheet owned by Solomon" "External"
         whatsapp    = softwareSystem "WhatsApp" "OTPs, meeting reminders, group auto-capture" "External"
         cloudflare  = softwareSystem "Cloudflare R2" "Object storage for PDFs, minutes, media" "External"
-        claudeCli   = softwareSystem "Claude CLI" "claude -p subprocess on Hetzner (Max subscription, no API key) - Ask/audit/narrative primary" "External"
+        claudeCli   = softwareSystem "Claude CLI" "claude -p subprocess on Hetzner (subscription tokens, no API key) - Ask/audit/narrative primary. claude_cli.complete() tries the main account, then a backup account (CLAUDE_CODE_OAUTH_TOKEN_2), treating any limit/login notice as a failure so DeepSeek and Groq fallbacks run. See ADR-036" "External"
         gemini      = softwareSystem "Gemini API" "Gemini 2.5 Flash - AI fallback (gemini-2.0-flash retired, 404) + design-loop critic (nano banana needs paid tier)" "External"
         groq        = softwareSystem "Groq API" "openai/gpt-oss-120b - final AI fallback (llama-3.3-70b decommissioned, 404); Whisper transcription fallback" "External"
         deepgram    = softwareSystem "Deepgram API" "nova-3 speech-to-text with speaker diarization - primary meeting-recording transcription (ADR-022)" "External"
