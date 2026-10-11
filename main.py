@@ -703,7 +703,10 @@ async def _ai_complete(prompt: str, claude_timeout: int = 150) -> str:
                 stdout=_aio.subprocess.PIPE, stderr=_aio.subprocess.DEVNULL, env=env)
             stdout, _ = await _aio.wait_for(proc.communicate(), timeout=claude_timeout)
             if proc.returncode == 0:
-                raw = stdout.decode().strip()
+                import claude_cli as _cc
+                raw = _cc.usable(stdout.decode())
+                if not raw:
+                    _lg_ai.getLogger("main").warning("claude CLI gave no usable answer (limit or login notice?): %s", stdout.decode()[:120])
         except Exception:
             pass
     if not raw:
@@ -2122,7 +2125,8 @@ Keep "decisions" in the SAME per-group shape shown in CURRENT MINUTES above."""
             # empty -> the friendly "couldn't apply" message even on a valid instruction.
             stdout, _ = await _aio.wait_for(proc.communicate(), timeout=600)
             if proc.returncode == 0:
-                raw = stdout.decode().strip()
+                import claude_cli as _cc
+                raw = _cc.usable(stdout.decode())
         except Exception:
             pass
 
@@ -8595,9 +8599,10 @@ def _ask_claude(prompt: str, model: str = "sonnet", timeout: int = 120) -> str:
             ["claude", "-p", prompt, "--model", model],
             capture_output=True, text=True, timeout=timeout, env=env
         )
-        if r.returncode == 0 and r.stdout.strip():
+        import claude_cli as _cc
+        if r.returncode == 0 and _cc.usable(r.stdout):
             _ai_ok()
-            return r.stdout.strip()
+            return _cc.usable(r.stdout)
         _ai_failed("rc=%s %s" % (r.returncode, (r.stderr or r.stdout or "")[-300:]))
         return ""
     except _sp.TimeoutExpired:
@@ -8622,7 +8627,8 @@ async def _ask_claude_async(prompt: str, model: str = "haiku", timeout: int = 40
             env=env
         )
         stdout, stderr = await _aio.wait_for(proc.communicate(), timeout=timeout)
-        out = stdout.decode().strip()
+        import claude_cli as _cc
+        out = _cc.usable(stdout.decode())
         if proc.returncode == 0 and out:
             _ai_ok()
             return out

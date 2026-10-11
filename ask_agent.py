@@ -194,9 +194,10 @@ def _chat(prompt: str, max_tokens: int = 1024) -> str:
             ["claude", "-p", fit_prompt(prompt, 100000), "--model", "sonnet"],
             capture_output=True, text=True, timeout=90, env=env
         )
-        if r.returncode == 0 and r.stdout.strip():
-            return r.stdout.strip()
-        last_err = r.stderr[:200] if r.stderr else "claude returned empty"
+        import claude_cli
+        if r.returncode == 0 and claude_cli.usable(r.stdout):
+            return claude_cli.usable(r.stdout)
+        last_err = r.stderr[:200] if r.stderr else "claude returned empty or a limit notice"
     except Exception as e:
         last_err = e
 

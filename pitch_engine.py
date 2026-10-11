@@ -103,7 +103,8 @@ def _via_haiku(prompt):
             capture_output=True, timeout=60, env=env,
         )
         if out.returncode == 0:
-            return out.stdout.decode().strip()
+            import claude_cli
+            return claude_cli.usable(out.stdout.decode())
     except Exception as e:
         log.warning("haiku error: %s", e)
     return ""

@@ -2891,3 +2891,22 @@ class TestPoolDropsDeadConnections:
         monkeypatch.setattr(_db, "_pool", pool)
         c = _db.get_conn()
         assert c.bad is False and pool.discarded == 1
+
+
+class TestClaudeLimitNoticeIsNotAnAnswer:
+    def test_notices_are_failures_and_real_answers_pass(self):
+        import claude_cli as c
+        for n in ("You've hit your weekly limit \u00b7 resets 5am (UTC)", "Not logged in \u00b7 Please run /login",
+                  "Credit balance is too low", "Claude AI usage limit reached|1760000000"):
+            assert c.usable(n) == "" and c.is_notice(n), n
+        ok = '{"summary": "The club discussed its usage limit on the loan product at length"}'
+        assert c.usable(ok) == ok.strip() and c.usable("  fine  ") == "fine" and c.usable("") == "" and c.usable(None) == ""
+        long = "The weekly limit reached by members was discussed. " * 20
+        assert c.usable(long) == long.strip()          # a long real answer that mentions limits is kept
+
+    def test_every_cli_call_site_uses_the_guard(self):
+        for f in ("main.py", "ask_agent.py", "pitch_engine.py"):
+            src = open(os.path.join(_APP_ROOT, f)).read()
+            assert "claude_cli" in src, f
+        m = open(os.path.join(_APP_ROOT, "main.py")).read()
+        assert m.count("_cc.usable(") >= 5
