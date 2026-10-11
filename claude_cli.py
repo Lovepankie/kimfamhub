@@ -24,6 +24,9 @@ def usable(text):
     return "" if (not t or is_notice(t)) else t
 
 
+LAST_FAILURE = ""          # why the last attempt failed (CLI stderr or notice, never a token), for health reporting
+
+
 def tokens(env=None):
     """OAuth tokens to try, in order: the main account, then the backup (CLAUDE_CODE_OAUTH_TOKEN_2). Values, never logged."""
     import os
@@ -45,8 +48,12 @@ def complete(prompt, model="haiku", timeout=120, env=None, runner=None):
     import subprocess
     import logging
 
+    global LAST_FAILURE
+
     def _run(args, e, t):
         r = subprocess.run(args, capture_output=True, text=True, timeout=t, env=e)
+        if r.returncode != 0 or not usable(r.stdout):
+            globals()["LAST_FAILURE"] = ((r.stderr or "") + " " + (r.stdout or "")).strip()[-300:]
         return r.returncode, r.stdout
 
     run = runner or _run
@@ -59,10 +66,14 @@ def complete(prompt, model="haiku", timeout=120, env=None, runner=None):
         try:
             rc, out = run(["claude", "-p", prompt, "--model", model], e, timeout)
         except Exception as ex:
+            LAST_FAILURE = "timed out" if type(ex).__name__ == "TimeoutExpired" else repr(ex)
             logging.getLogger("main").warning("claude CLI account %d failed: %s", i + 1, type(ex).__name__)
             continue
         ans = usable(out)
         if rc == 0 and ans:
+            LAST_FAILURE = ""
             return ans
+        if not LAST_FAILURE:
+            LAST_FAILURE = (out or "").strip()[-300:]
         logging.getLogger("main").warning("claude CLI account %d gave no usable answer (rc=%s): %.80s", i + 1, rc, (out or "").strip())
     return ""

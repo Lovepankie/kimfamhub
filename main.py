@@ -8583,7 +8583,7 @@ def _ask_claude(prompt: str, model: str = "sonnet", timeout: int = 120) -> str:
         if out:
             _ai_ok()
             return out
-        _ai_failed("no usable answer from any Claude account (limit, login or timeout)")
+        _ai_failed(_cc.LAST_FAILURE or "no usable answer from any Claude account (limit, login or timeout)")
         return ""
     except Exception as e:
         _ai_failed(repr(e))
@@ -8600,7 +8600,7 @@ async def _ask_claude_async(prompt: str, model: str = "haiku", timeout: int = 40
         if out:
             _ai_ok()
             return out
-        _ai_failed("no usable answer from any Claude account (limit, login or timeout)")
+        _ai_failed(_cc.LAST_FAILURE or "no usable answer from any Claude account (limit, login or timeout)")
         return ""
     except Exception as e:
         _ai_failed(repr(e))
