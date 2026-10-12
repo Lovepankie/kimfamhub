@@ -19,9 +19,11 @@ _CHECK_LABELS = {
 
 _CCY = r"(?:UGX|USH|UShs?|Shs?\.?|UG\s?X)"
 _NUM = r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?"
-_AMOUNT_RE = re.compile(
-    r"(?<![A-Za-z])" + _CCY + r"\s*[:.]?\s*(" + _NUM + r")(?![\d,])|(" + _NUM + r")\s*(?:/=|" + _CCY + r"(?![A-Za-z]))",
-    re.I)
+_AMOUNT_A = re.compile(r"(?<![A-Za-z])" + _CCY + r"\s*[:.]?\s*(" + _NUM + r")(?![\d,])", re.I)
+_AMOUNT_B = re.compile(r"(?<![\d,.])(" + _NUM + r")\s*(?:/=|" + _CCY + r"(?![A-Za-z]))", re.I)
+# "UGX 4m", "UGX 4 million" and space grouped "UGX 4 000 000" are not read: no guess, so no auto-close
+_SCALED_RE = re.compile(r"(?<![A-Za-z])" + _CCY + r"\s*[:.]?\s*(?:\d+(?:\.\d+)?\s?(?:m|k|mn|bn|million|thousand|billion)\b|\d{1,3}(?:[ \u00a0]\d{3})+)", re.I)
+_NOT_A_PAYMENT_AMOUNT = re.compile(r"(fee|fees|charge|charges|balance|tax|duty|commission|levy|excise)\W{0,12}$", re.I)
 
 
 def _to_int(num):
@@ -42,13 +44,30 @@ def _to_int(num):
 def parse_amount(text):
     """The single clear UGX amount in `text`, else None. 'UGX 4,000,000', 'UGX4000000', '4,000,000/=' and
     '4,000,000 UGX' all count. The same figure repeated is one amount; two different figures, or none, give None."""
+    found = _amounts(text)
+    return next(iter(found)) if found is not None and len(found) == 1 else None
+
+
+def _amounts(text, skip_fees=False):
+    """The set of currency-adjacent whole-shilling amounts in `text`; None when any is unreadable (scaled, space
+    grouped, fractional). A bare year before the currency is not an amount. skip_fees drops figures that follow
+    fee, charge, balance, tax and similar words (a statement lists those next to the payment)."""
+    text = text or ""
+    if _SCALED_RE.search(text):
+        return None
     found = set()
-    for m in _AMOUNT_RE.finditer(text or ""):
-        v = _to_int(m.group(1) or m.group(2))
-        if v is None:
-            return None
-        found.add(v)
-    return found.pop() if len(found) == 1 else None
+    for rx in (_AMOUNT_A, _AMOUNT_B):
+        for m in rx.finditer(text):
+            raw = m.group(1)
+            if rx is _AMOUNT_B and re.fullmatch(r"(19|20)\d\d", raw):
+                continue                                # "Fees 2026 UGX ..." : a year, not an amount
+            if skip_fees and _NOT_A_PAYMENT_AMOUNT.search(text[max(0, m.start() - 30):m.start()]):
+                continue
+            v = _to_int(raw)
+            if v is None:
+                return None
+            found.add(v)
+    return found
 
 
 def _names(members):
@@ -87,15 +106,56 @@ def _as_date(v):
     return None
 
 
-_FAIL_WORDS = re.compile(r"\b(fail(ed|ure)?|declined|rejected|reversed|unsuccessful|insufficient|cancel(l)?ed|error|pending|processing|in progress|awaiting)\b", re.I)
+_MONTHS = {m: i for i, m in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
+_MON = r"(Jan[a-z]*|Feb[a-z]*|Mar[a-z]*|Apr[a-z]*|May|Jun[a-z]*|Jul[a-z]*|Aug[a-z]*|Sep[a-z]*|Oct[a-z]*|Nov[a-z]*|Dec[a-z]*)"
+_D_ISO = re.compile(r"(?<!\d)(\d{4})-(\d{2})-(\d{2})(?!\d)")
+_D_NUM = re.compile(r"(?<![\d./-])(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})(?!\d)")
+_D_DMY = re.compile(r"(?<!\d)(\d{1,2})(?:st|nd|rd|th)?[\s,.-]+" + _MON + r"\.?[\s,.-]+(\d{4})(?!\d)", re.I)
+_D_MDY = re.compile(_MON + r"\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})(?!\d)", re.I)
+
+
+def parse_dates(text):
+    """Every date printed in `text` as real dates. Numeric dates are read day first (dd/mm/yyyy, the local
+    convention); the caller also refuses a date in the future, which rules out the month-first reading for
+    recent proofs. Month names and ISO dates are unambiguous."""
+    out = set()
+
+    def add(y, mo, d):
+        try:
+            out.add(date(int(y), int(mo), int(d)))
+        except ValueError:
+            pass
+    t = text or ""
+    for y, mo, d in _D_ISO.findall(t):
+        add(y, mo, d)
+    for d, mo, y in _D_NUM.findall(t):
+        add(y, mo, d)
+    for d, mon, y in _D_DMY.findall(t):
+        add(y, _MONTHS.get(mon[:3].lower(), 0), d)
+    for mon, d, y in _D_MDY.findall(t):
+        add(y, _MONTHS.get(mon[:3].lower(), 0), d)
+    return out
+
+
+def _name_in_text(name, text):
+    """True when a word of the proposed name (3+ letters) appears in the document text as a whole word."""
+    words = re.findall(r"[A-Za-z]{3,}", name or "")
+    return any(re.search(r"(?<![A-Za-z])" + re.escape(w) + r"(?![A-Za-z])", text or "", re.I) for w in words)
+
+
+_FAIL_WORDS = re.compile(r"\b(fail(ed|ure)?|declined|rejected|reversed|unsuccessful|insufficient|cancel(l)?ed|error|pending|processing|in progress|awaiting|under review|on hold|queued|scheduled|not\s+(?:been\s+)?(?:successful|successfully|completed|sent|paid|confirmed|approved|processed|received))\b", re.I)
 _OK_WORDS = re.compile(r"\b(success(ful(ly)?)?|completed|confirmed|sent|transferred|approved|paid)\b", re.I)
 
 
-def validate_facts(raw, text):
-    """Turn the model's proposed `payment` object into trusted facts using the document text. Returns a dict with
-    status, amount_ugx, payer, recipient, date. Anything that cannot be verified becomes unknown/None."""
+def validate_facts(raw, text, today=None):
+    """Turn the model's proposed `payment` object into trusted facts using the document text. The model only
+    proposes: status needs a success word and no failure or negation word; the amount must be the ONLY payment
+    amount printed next to a currency (fees and balances aside); payer and recipient must each contain a word that
+    is printed in the document; the date must be one of the dates printed in the document and not in the future;
+    a reference must be printed. Anything that cannot be verified becomes unknown/None."""
     raw = raw if isinstance(raw, dict) else {}
     text = text or ""
+    today = today or date.today()
     status = str(raw.get("status") or "unknown").strip().lower()
     if status not in ("success", "failed", "pending", "unknown"):
         status = "unknown"
@@ -105,20 +165,27 @@ def validate_facts(raw, text):
     if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
         amount = None
     if amount is not None:
-        plain = str(amount)
-        grouped = f"{amount:,}"
-        norm = re.sub(r"(?<=\d)[,\s](?=\d{3}\b)", "", text)
-        if not (re.search(r"(?<![\d,])" + re.escape(grouped) + r"(?![\d,])", text)
-                or re.search(r"(?<![\d.])" + re.escape(plain) + r"(?![\d])", norm)):
+        printed = _amounts(text, skip_fees=True)
+        if printed is None or printed != {amount}:
             amount = None
     d = _as_date(raw.get("date"))
+    if d is not None and (d not in parse_dates(text) or (d - today).days > 1):
+        d = None
 
     def _s(v):
         v = str(v).strip() if isinstance(v, str) else ""
         return v[:80] or None
 
-    return {"status": status, "amount_ugx": amount, "payer": _s(raw.get("payer")),
-            "recipient": _s(raw.get("recipient")), "date": d.isoformat() if d else None}
+    payer, recipient = _s(raw.get("payer")), _s(raw.get("recipient"))
+    if payer and not _name_in_text(payer, text):
+        payer = None
+    if recipient and not _name_in_text(recipient, text):
+        recipient = None
+    ref = _s(raw.get("reference"))
+    if ref and not (re.fullmatch(r"[A-Za-z0-9._-]{6,40}", ref) and ref in text):
+        ref = None
+    return {"status": status, "amount_ugx": amount, "payer": payer, "recipient": recipient,
+            "date": d.isoformat() if d else None, "reference": ref}
 
 
 def failed_checks(result):
@@ -165,11 +232,14 @@ def decide(facts, action, members, guards=None):
         reasons.append("payer is not the action owner")
 
     proof_day, deadline = _as_date(facts.get("date")), _as_date(action.get("deadline"))
-    on_time = bool(proof_day and deadline and proof_day <= deadline)
+    created = _as_date(action.get("created_at"))
+    on_time = bool(proof_day and deadline and created and created <= proof_day <= deadline)
     if not deadline:
         reasons.append("action has no deadline")
+    elif not created:
+        reasons.append("action creation date unknown")
     elif not on_time:
-        reasons.append("proof date is missing or after the deadline")
+        reasons.append("proof date is missing, after the deadline, or older than the action")
 
     recipient = match_member(facts.get("recipient") or "", members)
     named = [n for n in members_in(desc, members) if n != owner]

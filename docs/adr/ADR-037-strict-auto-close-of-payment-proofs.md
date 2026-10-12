@@ -15,7 +15,7 @@ exactly as before: the document is filed and a comment is added.
 1. **Succeeded.** The proof says the transfer succeeded (status `success`, and the document text itself says so and does
    not say failed, declined, pending or reversed).
 2. **Amount.** The proof amount equals the action amount exactly. The amount is parsed from the description (for example
-   `UGX 4,000,000`); no single clear amount means no auto-close.
+   `UGX 123,000`); no single clear amount means no auto-close.
 3. **Payer is the owner.** The payer name matches a Hub member by whole-word match on the member name (so a surname
    variant still matches), and that member is the action assignee.
 4. **On time.** The proof date is on or before the action deadline. No deadline means no auto-close.
@@ -45,3 +45,14 @@ Extra safeguards, all of which must also hold:
   so an admin still closes it by hand. This is intended.
 - Watch: member matching is by first name, so a payer string naming two members never matches. The model prompt and the
   rules live in `payment_proof.py` and `main.py`; changing a rule needs a new ADR.
+
+## Amendment (12 Oct 2026, after independent review)
+The first build trusted the model for payer, recipient and date, and a negated or look-alike document could pass. Now code verifies every fact against the document text before the five rules run:
+- **Status** needs a success word and no failure or negation word ("not successful", "under review", "queued" and similar).
+- **Amount** must be the only payment amount printed next to a currency, ignoring figures that follow fee, charge, balance, tax and similar words. Scaled ("4m"), space grouped and fractional amounts, in the document or the action description, are not read, so they never close anything. A bare year before the currency is not an amount.
+- **Payer and recipient** must each share a word with a name printed in the document.
+- **Date** must be one of the dates printed in the document, read day first for numeric forms, and not in the future. The proof date must also be on or after the action's creation date, so an old receipt cannot close a new recurring action.
+- **Reference** (the printed transaction id) is stored with the file hash; a second file with the same reference never closes another action.
+- **Sender:** a post from a shared phone (env KIMFAM_SHARED_PHONES, one device used by several people) never auto-closes, even for an admin.
+- **Reopen** is allowed only within 7 days and only when payment_proofs recorded the auto-close, not merely because the last status change carries the auto-close author name.
+Residual risk, accepted: members are matched by first name, so an outsider who shares a member's first name and prints it on a proof can satisfy the payer or recipient check. The group announcement with its one-line reopen, and the sender and ownership checks, are the mitigation.

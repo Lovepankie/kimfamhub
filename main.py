@@ -5603,7 +5603,9 @@ async def agent_classify_doc(request: Request):
         "\"payment\": null, or when the document is a bank or mobile-money payment proof an object "
         "{\"status\": \"success\"|\"failed\"|\"pending\"|\"unknown\", \"amount_ugx\": whole number as printed in the document or null, "
         "\"payer\": name of the sender or null, \"recipient\": name of the receiver or null, "
-        "\"date\": \"YYYY-MM-DD\" or null}}. Use status success only if the document itself says the transfer succeeded."
+        "\"date\": the transaction date printed in the document as \"YYYY-MM-DD\" (numeric dates are day first) or null, "
+        "\"reference\": the transaction or reference id printed in the document or null}}. Use status success only if the "
+        "document itself says the transfer succeeded. Copy names, amounts and ids exactly as printed; never infer them."
         "\n\nDocument follows:\n\n"
         + text[:12000]
     )
@@ -5700,10 +5702,19 @@ def _proofs_ready() -> bool:
                 cur.execute("CREATE TABLE IF NOT EXISTS payment_proofs ("
                             "sha256 TEXT PRIMARY KEY, action_ref TEXT NOT NULL, "
                             "used_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
+                cur.execute("ALTER TABLE payment_proofs ADD COLUMN IF NOT EXISTS reference TEXT")
+                cur.execute("ALTER TABLE payment_proofs ADD COLUMN IF NOT EXISTS auto_closed BOOLEAN NOT NULL DEFAULT FALSE")
+                cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS payment_proofs_reference_uq ON payment_proofs (reference) WHERE reference IS NOT NULL")
         _PROOF_READY = True
     except Exception as e:
         log.warning(f"payment_proofs unavailable: {e}")
     return _PROOF_READY
+
+
+def _shared_phone_digits() -> set:
+    """Digits of WhatsApp numbers shared by several people (env KIMFAM_SHARED_PHONES, comma separated). Kept out of
+    the repository on purpose."""
+    return {"".join(c for c in x if c.isdigit()) for x in os.environ.get("KIMFAM_SHARED_PHONES", "").split(",") if x.strip()}
 
 
 def _sender_member(phone: str):
@@ -5726,16 +5737,19 @@ def _try_auto_close(raw_bytes: bytes, text: str, payment: dict, action_ref: str,
     import auth as _am
     from db import query as _dbq, db as _db
     facts = _pp.validate_facts(payment, text)
-    rows = _dbq("SELECT id, ref, description, assignee, assignees, deadline, status FROM actions WHERE ref=%s", (action_ref,))
+    rows = _dbq("SELECT id, ref, description, assignee, assignees, deadline, status, created_at FROM actions WHERE ref=%s", (action_ref,))
     if not rows or not _proofs_ready():
         return {"auto_closed": False}
     act = rows[0]
     sha = hashlib.sha256(raw_bytes).hexdigest()
-    used = bool(_dbq("SELECT 1 FROM payment_proofs WHERE sha256=%s", (sha,)))
+    ref_id = facts.get("reference")
+    used = bool(_dbq("SELECT 1 FROM payment_proofs WHERE sha256=%s OR (%s::text IS NOT NULL AND reference=%s)", (sha, ref_id, ref_id)))
     sender = _sender_member(sender_phone)
     payer = _pp.match_member(facts.get("payer") or "", _am.MEMBERS)
     is_admin = any(m["name"] == sender and m.get("role") == "admin" for m in _am.MEMBERS)
-    guards = {"sender_ok": bool(sender and (sender == payer or is_admin)), "proof_used": used}
+    # a shared phone (one device, several people) proves nobody: its posts never auto-close anything
+    shared = "".join(c for c in (sender_phone or "") if c.isdigit()) in _shared_phone_digits()
+    guards = {"sender_ok": bool(sender and not shared and (sender == payer or is_admin)), "proof_used": used}
     res = _pp.decide(facts, act, _am.MEMBERS, guards)
     out = {"auto_closed": False, "checks": res["checks"], "failed_checks": _pp.failed_checks(res), "reasons": res["reasons"]}
     if not res["close"]:
@@ -5744,7 +5758,7 @@ def _try_auto_close(raw_bytes: bytes, text: str, payment: dict, action_ref: str,
     try:
         with _db() as conn:
             with conn.cursor() as cur:
-                cur.execute("INSERT INTO payment_proofs (sha256, action_ref) VALUES (%s,%s) ON CONFLICT DO NOTHING", (sha, action_ref))
+                cur.execute("INSERT INTO payment_proofs (sha256, action_ref, reference, auto_closed) VALUES (%s,%s,%s,TRUE) ON CONFLICT DO NOTHING", (sha, action_ref, ref_id))
                 if cur.rowcount != 1:
                     raise RuntimeError("proof already used")
                 cur.execute("UPDATE actions SET status='done', closed_at=NOW() WHERE id=%s AND status IN ('open','in_progress')", (act["id"],))
@@ -5776,8 +5790,11 @@ async def internal_action_reopen(request: Request):
         raise _HE(status_code=404, detail=f"Action not found: {ref}")
     aid = rows[0]["id"]
     last = _dbq("SELECT author, new_value FROM action_updates WHERE action_id=%s AND type='status_change' ORDER BY id DESC LIMIT 1", (aid,))
-    if rows[0]["status"] != "done" or not last or last[0]["author"] != _AUTOCLOSE_AUTHOR or last[0]["new_value"] != "done":
-        raise _HE(status_code=409, detail="only an auto-closed action can be reopened this way")
+    if not _proofs_ready():
+        raise _HE(status_code=503, detail="proof table unavailable")
+    recent = _dbq("SELECT 1 FROM payment_proofs WHERE action_ref=%s AND auto_closed AND used_at > NOW() - INTERVAL '7 days'", (ref,))
+    if rows[0]["status"] != "done" or not last or last[0]["author"] != _AUTOCLOSE_AUTHOR or last[0]["new_value"] != "done" or not recent:
+        raise _HE(status_code=409, detail="only an action auto-closed in the last 7 days can be reopened this way")
     with _db() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE actions SET status='in_progress', closed_at=NULL WHERE id=%s AND status='done'", (aid,))
@@ -5786,6 +5803,7 @@ async def internal_action_reopen(request: Request):
             cur.execute("""INSERT INTO action_updates (action_id, author, text, type, old_value, new_value)
                            VALUES (%s,%s,%s,'status_change','done','in_progress')""",
                         (aid, by, f"Reopened by {by} after an auto-close."))
+            cur.execute("UPDATE payment_proofs SET auto_closed=FALSE WHERE action_ref=%s", (ref,))
     return {"ok": True, "action_ref": ref, "status": "in_progress"}
 
 
