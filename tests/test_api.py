@@ -2945,3 +2945,350 @@ class TestClaudeBackupAccount:
         assert "log" in src and "tok)" not in src.split("def complete")[1].replace("if tok:", "")
         assert c.tokens({"CLAUDE_CODE_OAUTH_TOKEN": "a"}) == ["a"] and c.tokens({}) == [None]
         assert c.tokens({"CLAUDE_CODE_OAUTH_TOKEN": "a", "CLAUDE_CODE_OAUTH_TOKEN_2": "a"}) == ["a"]
+
+
+# ── Strict auto-close of payment proofs (ADR-037). Synthetic names and numbers only. ──────────────────────
+import contextlib
+import datetime as _dt
+
+_PP_MEMBERS = [{"name": "Alpha", "role": "member"}, {"name": "Bravo", "role": "member"},
+               {"name": "Charlie", "role": "admin"}, {"name": "Delta", "role": "member"}]
+_PP_PHONES = {"Alpha": "256700000001", "Bravo": "256700000002", "Charlie": "256700000003", "Delta": "256700000004"}
+_PP_TEXT = "Transfer successful. UGX 4,000,000 sent from Alpha Tester to Bravo Tester on 2026-10-10. Ref 12345."
+_PP_FACTS = {"status": "success", "amount_ugx": 4000000, "payer": "Alpha Tester", "recipient": "Bravo Tester", "date": "2026-10-10"}
+
+
+class TestPaymentProofRules:
+    def _act(self, **kw):
+        a = {"description": "Pay UGX 4,000,000 for feed", "assignee": "Alpha", "assignees": ["Alpha"],
+             "deadline": _dt.date(2026, 10, 10), "status": "open"}
+        a.update(kw)
+        return a
+
+    def _facts(self, **kw):
+        f = dict(_PP_FACTS)
+        f.update(kw)
+        return f
+
+    def _decide(self, facts=None, action=None, guards=None):
+        import payment_proof as pp
+        return pp.decide(facts or self._facts(), action or self._act(), _PP_MEMBERS,
+                         guards or {"sender_ok": True, "proof_used": False})
+
+    def test_parse_amount(self):
+        import payment_proof as pp
+        assert pp.parse_amount("Pay UGX 4,000,000 now") == 4000000
+        assert pp.parse_amount("UGX4000000") == 4000000
+        assert pp.parse_amount("send 4,000,000/= to Bravo") == 4000000
+        assert pp.parse_amount("UGX 4,000,000 (that is 4,000,000 UGX)") == 4000000
+        assert pp.parse_amount("UGX 4,000,000 then UGX 500,000") is None
+        assert pp.parse_amount("buy feed") is None
+        assert pp.parse_amount("UGX 12.5") is None
+
+    def test_match_member_is_whole_word_and_handles_surnames(self):
+        import payment_proof as pp
+        assert pp.match_member("Alpha Tester", _PP_MEMBERS) == "Alpha"
+        assert pp.match_member("TESTER ALPHA", _PP_MEMBERS) == "Alpha"
+        assert pp.match_member("Alphabet Co", _PP_MEMBERS) is None
+        assert pp.match_member("Alpha and Bravo", _PP_MEMBERS) is None
+        assert pp.match_member("", _PP_MEMBERS) is None
+
+    def test_validate_facts_makes_the_model_prove_each_fact(self):
+        import payment_proof as pp
+        ok = pp.validate_facts(_PP_FACTS, _PP_TEXT)
+        assert ok["status"] == "success" and ok["amount_ugx"] == 4000000 and ok["date"] == "2026-10-10"
+        assert pp.validate_facts(dict(_PP_FACTS, amount_ugx=9000000), _PP_TEXT)["amount_ugx"] is None
+        assert pp.validate_facts(_PP_FACTS, "UGX 4,000,000 transfer declined")["status"] == "unknown"
+        assert pp.validate_facts(_PP_FACTS, "UGX 4,000,000 to Bravo")["status"] == "unknown"
+        assert pp.validate_facts(dict(_PP_FACTS, date="10/10/2026"), _PP_TEXT)["date"] is None
+        assert pp.validate_facts("junk", _PP_TEXT)["status"] == "unknown"
+
+    def test_worked_example_closes(self):
+        r = self._decide()
+        assert r["close"] is True and all(r["checks"].values()) and len(r["checks"]) == 5 and r["reasons"] == []
+
+    @pytest.mark.parametrize("name,facts,action", [
+        ("succeeded", {"status": "pending"}, {}),
+        ("amount_matches", {"amount_ugx": 3999999}, {}),
+        ("amount_matches", {}, {"description": "Pay for feed"}),
+        ("payer_is_owner", {"payer": "Bravo Tester", "recipient": "Delta"}, {}),
+        ("on_time", {"date": "2026-10-11"}, {}),
+        ("on_time", {}, {"deadline": None}),
+        ("recipient_ok", {"recipient": "Someone Else"}, {}),
+        ("recipient_ok", {"recipient": "Delta"}, {"description": "Pay UGX 4,000,000 to Bravo"}),
+        ("recipient_ok", {"recipient": "Alpha"}, {}),
+    ])
+    def test_each_rule_failing_alone_blocks_the_close(self, name, facts, action):
+        r = self._decide(self._facts(**facts), self._act(**action))
+        assert r["close"] is False and r["checks"][name] is False
+        assert [k for k, v in r["checks"].items() if not v] == [name]
+
+    def test_named_person_in_the_description_must_be_the_recipient(self):
+        assert self._decide(action=self._act(description="Alpha to pay UGX 4,000,000 to Bravo"))["close"] is True
+
+    def test_safeguards_block_the_close_even_when_all_five_pass(self):
+        assert self._decide(action=self._act(status="done"))["close"] is False
+        assert self._decide(action=self._act(status="cancelled"))["close"] is False
+        assert self._decide(guards={"sender_ok": False, "proof_used": False})["close"] is False
+        assert self._decide(guards={"sender_ok": True, "proof_used": True})["close"] is False
+        import payment_proof as pp
+        assert pp.decide(self._facts(), self._act(), _PP_MEMBERS)["close"] is False      # no guards: fails closed
+        assert self._decide(action=self._act(status="in_progress"))["close"] is True
+
+
+class _FakeProofDb:
+    """In-memory stand-in for the three tables the auto-close touches. Transactions roll back on an exception."""
+
+    def __init__(self, **action):
+        a = {"id": 1, "ref": "KIM/01/26-1", "description": "Pay UGX 4,000,000 for feed", "assignee": "Alpha",
+             "assignees": ["Alpha"], "deadline": _dt.date(2026, 10, 10), "status": "open"}
+        a.update(action)
+        self.actions = {a["ref"]: a}
+        self.updates, self.proofs, self.comments = [], {}, []
+
+    def query(self, sql, params=None):
+        if "FROM payment_proofs" in sql:
+            return [{"x": 1}] if params[0] in self.proofs else []
+        if "FROM action_updates" in sql:
+            ch = [u for u in self.updates if u["type"] == "status_change" and u["action_id"] == params[0]]
+            return ch[-1:]
+        if "FROM actions WHERE ref" in sql:
+            return [dict(a) for a in self.actions.values() if a["ref"] == params[0]]
+        return []
+
+    def execute(self, sql, params=None):
+        assert "INSERT INTO action_updates" in sql
+        self.comments.append(params)
+
+    @contextlib.contextmanager
+    def db(self):
+        import copy
+        snap = copy.deepcopy((self.actions, self.updates, self.proofs))
+        fake = self
+
+        class Cur:
+            rowcount = 0
+
+            def __enter__(s): return s
+            def __exit__(s, *a): return False
+
+            def execute(s, sql, params=None):
+                s.rowcount = 1
+                if "INSERT INTO payment_proofs" in sql:
+                    if params[0] in fake.proofs:
+                        s.rowcount = 0
+                    else:
+                        fake.proofs[params[0]] = params[1]
+                elif "UPDATE actions SET status='done'" in sql:
+                    a = next(x for x in fake.actions.values() if x["id"] == params[0])
+                    if a["status"] in ("open", "in_progress"):
+                        a["status"] = "done"
+                    else:
+                        s.rowcount = 0
+                elif "UPDATE actions SET status='in_progress'" in sql:
+                    a = next(x for x in fake.actions.values() if x["id"] == params[0])
+                    if a["status"] == "done":
+                        a["status"] = "in_progress"
+                    else:
+                        s.rowcount = 0
+                elif "INSERT INTO action_updates" in sql:
+                    new = "done" if "'done')" in sql.split("VALUES")[1] else "in_progress"
+                    fake.updates.append({"action_id": params[0], "author": params[1], "text": params[2], "type": "status_change",
+                                         "old_value": params[3] if len(params) > 3 else "done", "new_value": new})
+
+        class Conn:
+            def cursor(s): return Cur()
+
+        try:
+            yield Conn()
+        except Exception:
+            fake.actions, fake.updates, fake.proofs = snap
+            raise
+
+
+@pytest.fixture
+def proof_env(monkeypatch, tmp_path):
+    import db as _dbm
+    monkeypatch.setenv("KIMFAM_INTERNAL_KEY", "k-test")
+    monkeypatch.delenv("KIMFAM_AUTOCLOSE_OFF", raising=False)
+    monkeypatch.setattr(auth, "MEMBERS", _PP_MEMBERS)
+    monkeypatch.setattr(auth, "MEMBER_PHONES", _PP_PHONES)
+    import main as _m
+    monkeypatch.setattr(_m, "_PROOF_READY", True)
+    monkeypatch.setattr(_m, "_store_document_bytes", lambda b, c, f, s: {"filename": f, "group": s or "General", "r2_key": None, "r2_url": None, "archived_previous": False, "embedding": False})
+
+    def make(text=_PP_TEXT, **action):
+        fake = _FakeProofDb(**action)
+        monkeypatch.setattr(_dbm, "query", fake.query)
+        monkeypatch.setattr(_dbm, "execute", fake.execute)
+        monkeypatch.setattr(_dbm, "db", fake.db)
+        f = tmp_path / "proof.txt"
+        f.write_text(text)
+        return fake, str(f)
+    return make
+
+
+def _m_cats():
+    import main as _m
+    return list(_m._DOC_CATS)
+
+
+def _file_doc(path, payment=_PP_FACTS, sender="256700000001", ref="KIM/01/26-1", key="k-test"):
+    body = {"server_path": path, "filename": "proof.txt", "category": list(_m_cats())[0], "subgroup": "Proofs",
+            "related_action_ref": ref, "payment": payment, "sender_phone": sender}
+    return client.post("/api/agent/file-doc", json=body, headers={"X-Internal-Key": key} if key else {})
+
+
+class TestPaymentProofAutoClose:
+    def test_all_five_passing_closes_and_logs_the_checks(self, proof_env):
+        fake, path = proof_env()
+        r = _file_doc(path)
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["auto_closed"] is True and len(d["checks"]) == 5 and all(d["checks"].values())
+        assert fake.actions["KIM/01/26-1"]["status"] == "done"
+        u = fake.updates[-1]
+        assert u["author"] == "Rincol AI (auto-close)" and u["old_value"] == "open" and u["new_value"] == "done"
+        assert "payer is the action owner" in u["text"] and len(fake.proofs) == 1
+
+    @pytest.mark.parametrize("facts", [
+        {"status": "failed"}, {"amount_ugx": 4000001}, {"payer": "Bravo Tester", "recipient": "Delta"},
+        {"date": "2026-10-11"}, {"recipient": "Someone Else"},
+    ])
+    def test_each_rule_failing_alone_leaves_the_action_open_and_still_comments(self, proof_env, facts):
+        fake, path = proof_env()
+        d = _file_doc(path, dict(_PP_FACTS, **facts)).json()
+        assert d["auto_closed"] is False and len(d["failed_checks"]) == 1
+        assert fake.actions["KIM/01/26-1"]["status"] == "open" and fake.proofs == {} and d["action_commented"] is True
+
+    def test_no_deadline_or_no_clear_amount_never_closes(self, proof_env):
+        fake, path = proof_env(deadline=None)
+        assert _file_doc(path).json()["auto_closed"] is False
+        fake, path = proof_env(description="Pay for feed")
+        assert _file_doc(path).json()["auto_closed"] is False and fake.actions["KIM/01/26-1"]["status"] == "open"
+
+    def test_the_server_rechecks_facts_against_the_document_text(self, proof_env):
+        fake, path = proof_env(text="Transfer successful. UGX 1,000 from Alpha Tester to Bravo Tester 2026-10-10.")
+        assert _file_doc(path).json()["auto_closed"] is False
+        fake, path = proof_env(text="Transfer failed. UGX 4,000,000 from Alpha Tester to Bravo Tester 2026-10-10.")
+        assert _file_doc(path).json()["auto_closed"] is False
+
+    def test_sender_must_be_the_payer_or_an_admin(self, proof_env):
+        fake, path = proof_env()
+        assert _file_doc(path, sender="256700000004").json()["auto_closed"] is False       # Delta: neither
+        assert _file_doc(path, sender="").json()["auto_closed"] is False
+        assert _file_doc(path, sender="256700000003").json()["auto_closed"] is True        # Charlie: admin
+
+    def test_only_open_or_in_progress_actions_close(self, proof_env):
+        fake, path = proof_env(status="done")
+        assert _file_doc(path).json()["auto_closed"] is False and fake.updates == []
+        fake, path = proof_env(status="in_progress")
+        assert _file_doc(path).json()["auto_closed"] is True
+
+    def test_the_same_file_never_closes_a_second_action(self, proof_env):
+        fake, path = proof_env()
+        fake.actions["KIM/01/26-2"] = dict(fake.actions["KIM/01/26-1"], id=2, ref="KIM/01/26-2", status="open")
+        assert _file_doc(path).json()["auto_closed"] is True
+        d = _file_doc(path, ref="KIM/01/26-2").json()
+        assert d["auto_closed"] is False and fake.actions["KIM/01/26-2"]["status"] == "open"
+
+    def test_kill_switch_ignores_facts(self, proof_env, monkeypatch):
+        fake, path = proof_env()
+        monkeypatch.setenv("KIMFAM_AUTOCLOSE_OFF", "1")
+        d = _file_doc(path).json()
+        assert "auto_closed" not in d and fake.actions["KIM/01/26-1"]["status"] == "open" and d["action_commented"] is True
+
+    def test_a_failure_inside_auto_close_never_breaks_filing(self, proof_env, monkeypatch):
+        import main as _m
+        fake, path = proof_env()
+        monkeypatch.setattr(_m, "_try_auto_close", lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
+        r = _file_doc(path)
+        assert r.status_code == 200 and r.json()["ok"] is True and r.json()["auto_closed"] is False
+
+    def test_without_facts_behaviour_is_the_old_one(self, proof_env):
+        fake, path = proof_env()
+        d = _file_doc(path, payment=None).json()
+        assert "auto_closed" not in d and d["action_commented"] is True and fake.actions["KIM/01/26-1"]["status"] == "open"
+
+
+class TestPaymentProofReopen:
+    def _reopen(self, ref="KIM/01/26-1", by="Alpha", key="k-test"):
+        return client.post("/api/internal/actions/reopen", json={"action_ref": ref, "by": by},
+                           headers={"X-Internal-Key": key} if key else {})
+
+    def test_reopen_after_an_auto_close_sets_in_progress_and_logs(self, proof_env):
+        fake, path = proof_env()
+        assert _file_doc(path).json()["auto_closed"] is True
+        r = self._reopen()
+        assert r.status_code == 200 and fake.actions["KIM/01/26-1"]["status"] == "in_progress"
+        u = fake.updates[-1]
+        assert u["old_value"] == "done" and u["new_value"] == "in_progress" and u["author"] == "Alpha"
+        assert self._reopen().status_code == 409                                       # not done any more
+
+    def test_reopen_refused_when_the_last_change_was_not_an_auto_close(self, proof_env):
+        fake, path = proof_env(status="done")
+        assert self._reopen().status_code == 409
+        fake.updates.append({"action_id": 1, "author": "Charlie", "text": "x", "type": "status_change", "old_value": "open", "new_value": "done"})
+        assert self._reopen().status_code == 409 and fake.actions["KIM/01/26-1"]["status"] == "done"
+
+    def test_reopen_unknown_action_and_missing_fields(self, proof_env):
+        proof_env()
+        assert self._reopen(ref="KIM/99/26-9").status_code == 404
+        assert self._reopen(by="").status_code == 400
+
+    def test_routes_refuse_without_the_internal_key(self, proof_env):
+        fake, path = proof_env()
+        assert self._reopen(key=None).status_code == 403 and self._reopen(key="wrong").status_code == 403
+        assert _file_doc(path, key=None).status_code == 403
+        r = client.post("/api/agent/classify-doc", json={"server_path": path})
+        assert r.status_code == 403
+
+
+class TestPaymentProofSource:
+    def _src(self):
+        return open(os.path.join(_APP_ROOT, "main.py"), encoding="utf8").read()
+
+    def test_writes_are_committed_and_never_go_through_the_read_helper(self):
+        import re
+        src = self._src()
+        body = src[src.index("def _try_auto_close"):src.index("def internal_action_reopen")]
+        assert not re.search(r"\b(?:_q|_dbq|query)\(\s*[\"'](UPDATE|INSERT|DELETE)\b", body)
+        assert "with _db() as conn" in body and "INSERT INTO payment_proofs" in body and "ON CONFLICT DO NOTHING" in body
+        rb = src[src.index("def internal_action_reopen"):]
+        assert "with _db() as conn" in rb[:3500] and "_internal_key_ok(request)" in rb[:600]
+
+    def test_table_is_created_under_an_advisory_lock(self):
+        src = self._src()
+        body = src[src.index("def _proofs_ready"):src.index("def _sender_member")]
+        assert "pg_advisory_xact_lock" in body and "CREATE TABLE IF NOT EXISTS payment_proofs" in body and "sha256 TEXT PRIMARY KEY" in body
+
+    def test_classify_uses_the_claude_cli_chain_and_validates_the_payment(self):
+        src = self._src()
+        body = src[src.index("async def agent_classify_doc"):src.index("async def agent_file_doc")]
+        assert "_ask_claude_async" in body and "validate_facts" in body and "subprocess" not in body
+        assert 'claude", "-p"' not in body
+
+
+class TestPaymentProofClassify:
+    def test_classify_returns_only_verified_payment_facts(self, proof_env, monkeypatch):
+        import main as _m
+        fake, path = proof_env()
+
+        async def model(prompt, model="haiku", timeout=40):
+            return ('{"category": "' + _m_cats()[0] + '", "subgroup": "Proofs", "related_action_ref": null, "confidence": 0.9, "reason": "r", '
+                    '"payment": {"status": "success", "amount_ugx": 4000000, "payer": "Alpha Tester", "recipient": "Bravo Tester", "date": "2026-10-10"}}')
+
+        async def summ(label, text):
+            return "s"
+        monkeypatch.setattr(_m, "_ask_claude_async", model)
+        monkeypatch.setattr(_m, "_summarize_doc_text", summ)
+        monkeypatch.setattr(_m, "_extract_doc_text", lambda f, b: b.decode())
+        r = client.post("/api/agent/classify-doc", json={"server_path": path, "filename": "proof.pdf"}, headers={"X-Internal-Key": "k-test"})
+        assert r.status_code == 200, r.text
+        assert r.json()["payment"] == _PP_FACTS
+        open(path, "w").write("Transfer failed. UGX 4,000,000 Alpha Tester to Bravo Tester.")
+        assert client.post("/api/agent/classify-doc", json={"server_path": path, "filename": "proof.pdf"},
+                           headers={"X-Internal-Key": "k-test"}).json()["payment"]["status"] == "unknown"
+        monkeypatch.setenv("KIMFAM_AUTOCLOSE_OFF", "1")
+        assert client.post("/api/agent/classify-doc", json={"server_path": path, "filename": "proof.pdf"},
+                           headers={"X-Internal-Key": "k-test"}).json()["payment"] is None

@@ -5599,7 +5599,12 @@ async def agent_classify_doc(request: Request):
         "\n\nReturn ONLY a JSON object: {\"category\": one of [" + ", ".join(_DOC_CATS) + "], "
         "\"subgroup\": an existing sub-group name if one fits, else a concise new Title Case name, "
         "\"related_action_ref\": the single best matching action ref or null, "
-        "\"confidence\": a number 0.0-1.0, \"reason\": one short sentence}.\n\nDocument follows:\n\n"
+        "\"confidence\": a number 0.0-1.0, \"reason\": one short sentence, "
+        "\"payment\": null, or when the document is a bank or mobile-money payment proof an object "
+        "{\"status\": \"success\"|\"failed\"|\"pending\"|\"unknown\", \"amount_ugx\": whole number as printed in the document or null, "
+        "\"payer\": name of the sender or null, \"recipient\": name of the receiver or null, "
+        "\"date\": \"YYYY-MM-DD\" or null}}. Use status success only if the document itself says the transfer succeeded."
+        "\n\nDocument follows:\n\n"
         + text[:12000]
     )
     raw_out = (await _ask_claude_async(prompt, model="haiku", timeout=60) or "").strip()
@@ -5618,14 +5623,19 @@ async def agent_classify_doc(request: Request):
         except Exception:
             pass
     summary = await _summarize_doc_text((category + "/" + fname) if category else fname, text)
+    payment = None
+    if isinstance(cls.get("payment"), dict) and not _autoclose_off():
+        import payment_proof as _pp
+        payment = _pp.validate_facts(cls.get("payment"), text)        # the model proposes, code verifies
     return {"category": category, "subgroup": (cls.get("subgroup") or "").strip(),
             "related_action_ref": aref, "confidence": cls.get("confidence"),
-            "reason": (cls.get("reason") or "")[:200], "summary": summary, "filename": fname}
+            "reason": (cls.get("reason") or "")[:200], "summary": summary, "filename": fname,
+            "payment": payment}
 
 @app.post("/api/agent/file-doc")
 async def agent_file_doc(request: Request):
     """Internal (agent): after Hillary approves, file an inbound document (R2 + docs/ + embed) and
-    comment on the matched action. Never closes the action."""
+    comment on the matched action. Closes the action only under the strict five-rule check (ADR-037)."""
     from fastapi import HTTPException as _HE
     from db import query as _dbq, execute as _exec
     if not _internal_key_ok(request):
@@ -5655,7 +5665,128 @@ async def agent_file_doc(request: Request):
                 commented = True
         except Exception as e:
             log.warning(f"file-doc action comment failed: {e}")
-    return {"ok": True, **res, "action_ref": action_ref or None, "action_commented": commented}
+    out = {"ok": True, **res, "action_ref": action_ref or None, "action_commented": commented}
+    if action_ref and isinstance(body.get("payment"), dict) and not _autoclose_off():
+        try:
+            raw_bytes = p.read_bytes()
+            out.update(_try_auto_close(raw_bytes, _extract_doc_text(fname, raw_bytes), body.get("payment"),
+                                       action_ref, str(body.get("sender_phone") or "")))
+        except Exception as e:
+            log.warning(f"file-doc auto-close skipped: {e}")
+            out["auto_closed"] = False
+    return out
+
+
+# ── Strict auto-close of payment proofs (ADR-037) ─────────────────────────────
+_PROOF_LOCK_KEY = 778815
+_PROOF_READY = False
+_AUTOCLOSE_AUTHOR = "Rincol AI (auto-close)"
+
+
+def _autoclose_off() -> bool:
+    return os.environ.get("KIMFAM_AUTOCLOSE_OFF", "") == "1"
+
+
+def _proofs_ready() -> bool:
+    """Create payment_proofs (app-owned) once per process under an advisory lock, like decision_trace.ready()."""
+    global _PROOF_READY
+    if _PROOF_READY:
+        return True
+    try:
+        from db import db as _db
+        with _db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_xact_lock(%s)", (_PROOF_LOCK_KEY,))
+                cur.execute("CREATE TABLE IF NOT EXISTS payment_proofs ("
+                            "sha256 TEXT PRIMARY KEY, action_ref TEXT NOT NULL, "
+                            "used_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
+        _PROOF_READY = True
+    except Exception as e:
+        log.warning(f"payment_proofs unavailable: {e}")
+    return _PROOF_READY
+
+
+def _sender_member(phone: str):
+    """The member whose WhatsApp number is `phone` (digits compared), else None."""
+    digits = "".join(c for c in (phone or "") if c.isdigit())
+    if not digits:
+        return None
+    import auth as _am
+    for name, num in _am.MEMBER_PHONES.items():
+        if num and "".join(c for c in num if c.isdigit()) == digits:
+            return name
+    return None
+
+
+def _try_auto_close(raw_bytes: bytes, text: str, payment: dict, action_ref: str, sender_phone: str) -> dict:
+    """Decide and, only when all five rules and the safeguards hold, close the action in one transaction.
+    The facts are re-validated here against the document text (the agent only relays them)."""
+    import hashlib
+    import payment_proof as _pp
+    import auth as _am
+    from db import query as _dbq, db as _db
+    facts = _pp.validate_facts(payment, text)
+    rows = _dbq("SELECT id, ref, description, assignee, assignees, deadline, status FROM actions WHERE ref=%s", (action_ref,))
+    if not rows or not _proofs_ready():
+        return {"auto_closed": False}
+    act = rows[0]
+    sha = hashlib.sha256(raw_bytes).hexdigest()
+    used = bool(_dbq("SELECT 1 FROM payment_proofs WHERE sha256=%s", (sha,)))
+    sender = _sender_member(sender_phone)
+    payer = _pp.match_member(facts.get("payer") or "", _am.MEMBERS)
+    is_admin = any(m["name"] == sender and m.get("role") == "admin" for m in _am.MEMBERS)
+    guards = {"sender_ok": bool(sender and (sender == payer or is_admin)), "proof_used": used}
+    res = _pp.decide(facts, act, _am.MEMBERS, guards)
+    out = {"auto_closed": False, "checks": res["checks"], "failed_checks": _pp.failed_checks(res), "reasons": res["reasons"]}
+    if not res["close"]:
+        return out
+    old = act["status"]
+    try:
+        with _db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO payment_proofs (sha256, action_ref) VALUES (%s,%s) ON CONFLICT DO NOTHING", (sha, action_ref))
+                if cur.rowcount != 1:
+                    raise RuntimeError("proof already used")
+                cur.execute("UPDATE actions SET status='done', closed_at=NOW() WHERE id=%s AND status IN ('open','in_progress')", (act["id"],))
+                if cur.rowcount != 1:
+                    raise RuntimeError("action no longer open")
+                cur.execute("""INSERT INTO action_updates (action_id, author, text, type, old_value, new_value)
+                               VALUES (%s,%s,%s,'status_change',%s,'done')""",
+                            (act["id"], _AUTOCLOSE_AUTHOR, "Auto-closed on a payment proof. Checks passed: " + _pp.checks_text(res) + ".", old))
+    except Exception as e:
+        log.warning(f"auto-close rolled back: {e}")
+        return out
+    return {"auto_closed": True, "checks": res["checks"], "failed_checks": [], "reasons": []}
+
+
+@app.post("/api/internal/actions/reopen")
+async def internal_action_reopen(request: Request):
+    """Undo an auto-close. Internal key only. Allowed only when the latest status change on the action is an auto-close."""
+    from fastapi import HTTPException as _HE
+    from db import query as _dbq, db as _db
+    if not _internal_key_ok(request):
+        raise _HE(status_code=403, detail="forbidden")
+    body = await request.json()
+    ref = str(body.get("action_ref", "")).strip()
+    by = str(body.get("by", "")).strip()[:60]
+    if not ref or not by:
+        raise _HE(status_code=400, detail="action_ref and by required")
+    rows = _dbq("SELECT id, status FROM actions WHERE ref=%s", (ref,))
+    if not rows:
+        raise _HE(status_code=404, detail=f"Action not found: {ref}")
+    aid = rows[0]["id"]
+    last = _dbq("SELECT author, new_value FROM action_updates WHERE action_id=%s AND type='status_change' ORDER BY id DESC LIMIT 1", (aid,))
+    if rows[0]["status"] != "done" or not last or last[0]["author"] != _AUTOCLOSE_AUTHOR or last[0]["new_value"] != "done":
+        raise _HE(status_code=409, detail="only an auto-closed action can be reopened this way")
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE actions SET status='in_progress', closed_at=NULL WHERE id=%s AND status='done'", (aid,))
+            if cur.rowcount != 1:
+                raise _HE(status_code=409, detail="action changed, not reopened")
+            cur.execute("""INSERT INTO action_updates (action_id, author, text, type, old_value, new_value)
+                           VALUES (%s,%s,%s,'status_change','done','in_progress')""",
+                        (aid, by, f"Reopened by {by} after an auto-close."))
+    return {"ok": True, "action_ref": ref, "status": "in_progress"}
 
 
 # ── Contributions (Sprint 1) ──────────────────────────────────────────────────
