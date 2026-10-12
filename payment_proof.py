@@ -198,7 +198,9 @@ def validate_facts(raw, text, today=None, members=None):
         recipient = None
     if members:
         # the member the name resolves to must be printed in the document by name: the model cannot add a member
-        printed_members = members_in(text, members)
+        # a name in free text (narration, purpose, "for ...") is a mention, not the sender or the receiver
+        parties = re.sub(r"\b(?:narration|purpose|reason|description|memo|notes?|remarks?|message)\b[^\n]*|\bfor\b[^\n.]{0,60}", " ", text, flags=re.I)
+        printed_members = members_in(parties, members)
         if payer and match_member(payer, members) not in printed_members:
             payer = None
         if recipient and match_member(recipient, members) not in printed_members:
