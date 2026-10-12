@@ -156,8 +156,9 @@ def _name_in_text(name, text):
 
 
 _KIN = re.compile(r"\b(dad|daddy|mum|mom|mummy|father|mother|brother|sister|uncle|aunt|aunty|chairman|treasurer|secretary|grandma|grandpa)\b", re.I)
-_FAIL_WORDS = re.compile(r"\b(fail(ed|ure)?|declined|rejected|reversed|unsuccessful|insufficient|cancel(l)?ed|error|pending|processing|in progress|awaiting|under review|on hold|queued|scheduled|incomplete|refund\w*|revers\w*|submitted|initiated|expired|timed out|void|for approval)\b", re.I)
+_FAIL_WORDS = re.compile(r"\b(fail(ed|ure)?|declined|rejected|reversed|unsuccessful|insufficient|cancel(l)?ed|error|pending|processing|in progress|awaiting|under review|on hold|queued|scheduled|incomplete|expired|timed out|for approval)\b", re.I)
 _OK_WORDS = re.compile(r"\b(success(ful(ly)?)?|completed|confirmed|approved)\b", re.I)
+_STATUS_BAD = re.compile(r"\bstatus\b\W{0,6}(?:refund\w*|revers\w*|void|submitted|initiated|incomplete|pending|processing|fail\w*|reject\w*|declin\w*|cancel\w*|expired)", re.I)
 _NEGATED = re.compile(r"\b(?:not|no|cannot|could\s?not|did\s?not|didn't|wasn't|isn't|unable)\b[^.\n]{0,30}?\b(?:success\w*|complet\w*|sent|paid|confirm\w*|approv\w*|process\w*|receiv\w*|transfer\w*)\b", re.I)
 
 
@@ -173,7 +174,7 @@ def validate_facts(raw, text, today=None, members=None):
     status = str(raw.get("status") or "unknown").strip().lower()
     if status not in ("success", "failed", "pending", "unknown"):
         status = "unknown"
-    if status == "success" and (_FAIL_WORDS.search(text) or _NEGATED.search(text) or not _OK_WORDS.search(text)):
+    if status == "success" and (_FAIL_WORDS.search(text) or _STATUS_BAD.search(text) or _NEGATED.search(text) or not _OK_WORDS.search(text)):
         status = "unknown"
     amount = raw.get("amount_ugx")
     if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
@@ -207,7 +208,7 @@ def validate_facts(raw, text, today=None, members=None):
             recipient = None
     ref = _s(raw.get("reference"))
     if ref and not (re.fullmatch(r"[A-Za-z0-9._/-]{6,40}", ref) and re.search(r"\d", ref)
-                    and re.search(r"(?:ref(?:erence)?|txn|trans(?:action)?|receipt|id)\s*(?:no\.?|id|number|#)?\s*[:#-]?\s*" + re.escape(ref), text, re.I)):
+                    and re.search(r"(?:ref(?:erence)?|txn|trans(?:action)?(?:\s*(?:id|no\.?|number))?|receipt|id)\b[^\n]{0,20}\n?\s*[:#-]?\s*" + re.escape(ref), text, re.I)):
         ref = None                    # a reference counts only when printed after a Ref / Transaction / ID label
     return {"status": status, "amount_ugx": amount, "payer": payer, "recipient": recipient,
             "date": d.isoformat() if d else None, "reference": ref}

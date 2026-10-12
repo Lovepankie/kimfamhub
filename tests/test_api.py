@@ -3404,12 +3404,19 @@ class TestPaymentProofReviewFixes:
     @pytest.mark.parametrize("text", [
         "Transaction could not be completed. Alpha to Bravo UGX 500,000 completed",
         "Status: Refunded. Alpha to Bravo UGX 500,000 completed",
+        "Status\nRefunded\nAlpha to Bravo UGX 500,000 completed",
         "Status: Incomplete. Alpha to Bravo UGX 500,000",
         "Request submitted for approval. Alpha to Bravo UGX 500,000 completed",
         "UGX 500,000 sent from Alpha to Bravo",
     ])
     def test_more_negated_or_non_final_statuses(self, text):
         assert self._vm(text)["status"] == "unknown"
+
+    def test_a_refund_in_the_narration_is_not_a_failed_status_and_a_table_layout_reference_reads(self):
+        doc = ("Bank confirms the payment.\nPayment Reference\n120 chicken refund and feeds\nTransaction ID Bank\nTXN55512345 Some Bank\n"
+               "Status\nSUCCESS\nAmount\nUGX 500,000.00\nFrom Alpha Test to Bravo Test 05/10/2026")
+        v = self._vm(doc, reference="TXN55512345")
+        assert v["status"] == "success" and v["reference"] == "TXN55512345" and v["amount_ugx"] == 500000
 
     def test_a_document_printing_two_dates_gives_no_date(self):
         t = "Transfer completed Alpha Bravo UGX 500,000 Txn date 05/08/2026. Printed 05/10/2026 Ref: ABC123456"
