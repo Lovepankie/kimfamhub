@@ -5628,7 +5628,8 @@ async def agent_classify_doc(request: Request):
     payment = None
     if isinstance(cls.get("payment"), dict) and not _autoclose_off():
         import payment_proof as _pp
-        payment = _pp.validate_facts(cls.get("payment"), text)        # the model proposes, code verifies
+        import auth as _auth_pp
+        payment = _pp.validate_facts(cls.get("payment"), text, members=_auth_pp.MEMBERS)        # the model proposes, code verifies
     return {"category": category, "subgroup": (cls.get("subgroup") or "").strip(),
             "related_action_ref": aref, "confidence": cls.get("confidence"),
             "reason": (cls.get("reason") or "")[:200], "summary": summary, "filename": fname,
@@ -5668,7 +5669,8 @@ async def agent_file_doc(request: Request):
         except Exception as e:
             log.warning(f"file-doc action comment failed: {e}")
     out = {"ok": True, **res, "action_ref": action_ref or None, "action_commented": commented}
-    if action_ref and isinstance(body.get("payment"), dict) and not _autoclose_off():
+    # only a PDF can close an action: a typed DOCX or XLSX can say anything, so it is filed and commented, never trusted
+    if action_ref and isinstance(body.get("payment"), dict) and not _autoclose_off() and fname.lower().endswith(".pdf"):
         try:
             raw_bytes = p.read_bytes()
             out.update(_try_auto_close(raw_bytes, _extract_doc_text(fname, raw_bytes), body.get("payment"),
@@ -5714,7 +5716,7 @@ def _proofs_ready() -> bool:
 def _shared_phone_digits() -> set:
     """Digits of WhatsApp numbers shared by several people (env KIMFAM_SHARED_PHONES, comma separated). Kept out of
     the repository on purpose."""
-    return {"".join(c for c in x if c.isdigit()) for x in os.environ.get("KIMFAM_SHARED_PHONES", "").split(",") if x.strip()}
+    return {"".join(c for c in x if c.isdigit())[-9:] for x in os.environ.get("KIMFAM_SHARED_PHONES", "").split(",") if x.strip()}
 
 
 def _sender_member(phone: str):
@@ -5736,7 +5738,7 @@ def _try_auto_close(raw_bytes: bytes, text: str, payment: dict, action_ref: str,
     import payment_proof as _pp
     import auth as _am
     from db import query as _dbq, db as _db
-    facts = _pp.validate_facts(payment, text)
+    facts = _pp.validate_facts(payment, text, members=_am.MEMBERS)
     rows = _dbq("SELECT id, ref, description, assignee, assignees, deadline, status, created_at FROM actions WHERE ref=%s", (action_ref,))
     if not rows or not _proofs_ready():
         return {"auto_closed": False}
@@ -5748,8 +5750,9 @@ def _try_auto_close(raw_bytes: bytes, text: str, payment: dict, action_ref: str,
     payer = _pp.match_member(facts.get("payer") or "", _am.MEMBERS)
     is_admin = any(m["name"] == sender and m.get("role") == "admin" for m in _am.MEMBERS)
     # a shared phone (one device, several people) proves nobody: its posts never auto-close anything
-    shared = "".join(c for c in (sender_phone or "") if c.isdigit()) in _shared_phone_digits()
-    guards = {"sender_ok": bool(sender and not shared and (sender == payer or is_admin)), "proof_used": used}
+    configured = os.environ.get("KIMFAM_SHARED_PHONES") is not None      # unset = nobody has said which phones are shared: no auto-close
+    shared = "".join(c for c in (sender_phone or "") if c.isdigit())[-9:] in _shared_phone_digits()
+    guards = {"sender_ok": bool(configured and sender and not shared and (sender == payer or is_admin)), "proof_used": used}
     res = _pp.decide(facts, act, _am.MEMBERS, guards)
     out = {"auto_closed": False, "checks": res["checks"], "failed_checks": _pp.failed_checks(res), "reasons": res["reasons"]}
     if not res["close"]:

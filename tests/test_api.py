@@ -3047,10 +3047,11 @@ class _FakeProofDb:
         a.update(action)
         self.actions = {a["ref"]: a}
         self.updates, self.proofs, self.comments, self.refs = [], {}, [], []
+        self.proof_age_days = 0
 
     def query(self, sql, params=None):
         if "FROM payment_proofs WHERE action_ref" in sql:
-            return [{"x": 1}] if params[0] in self.proofs.values() else []
+            return [{"x": 1}] if (params[0] in self.proofs.values() and self.proof_age_days <= 7) else []
         if "FROM payment_proofs" in sql:
             return [{"x": 1}] if (params[0] in self.proofs or (params[1] and params[1] in self.refs)) else []
         if "FROM action_updates" in sql:
@@ -3079,8 +3080,8 @@ class _FakeProofDb:
             def execute(s, sql, params=None):
                 s.rowcount = 1
                 if "INSERT INTO payment_proofs" in sql:
-                    if params[0] in fake.proofs:
-                        s.rowcount = 0
+                    if params[0] in fake.proofs or (len(params) > 2 and params[2] and params[2] in fake.refs):
+                        s.rowcount = 0                       # the primary key and the partial unique index on reference
                     else:
                         fake.proofs[params[0]] = params[1]
                         if len(params) > 2 and params[2]:
@@ -3121,6 +3122,8 @@ def proof_env(monkeypatch, tmp_path):
     monkeypatch.setattr(auth, "MEMBER_PHONES", _PP_PHONES)
     import main as _m
     monkeypatch.setattr(_m, "_PROOF_READY", True)
+    monkeypatch.setenv("KIMFAM_SHARED_PHONES", "256700000009")          # set (even to a phone nobody uses): the guard is configured
+    monkeypatch.setattr(_m, "_extract_doc_text", lambda f, b: b.decode())
     monkeypatch.setattr(_m, "_store_document_bytes", lambda b, c, f, s: {"filename": f, "group": s or "General", "r2_key": None, "r2_url": None, "archived_previous": False, "embedding": False})
 
     def make(text=_PP_TEXT, **action):
@@ -3128,7 +3131,7 @@ def proof_env(monkeypatch, tmp_path):
         monkeypatch.setattr(_dbm, "query", fake.query)
         monkeypatch.setattr(_dbm, "execute", fake.execute)
         monkeypatch.setattr(_dbm, "db", fake.db)
-        f = tmp_path / "proof.txt"
+        f = tmp_path / "proof.pdf"
         f.write_text(text)
         return fake, str(f)
     return make
@@ -3140,7 +3143,7 @@ def _m_cats():
 
 
 def _file_doc(path, payment=_PP_FACTS, sender="256700000001", ref="KIM/01/26-1", key="k-test"):
-    body = {"server_path": path, "filename": "proof.txt", "category": list(_m_cats())[0], "subgroup": "Proofs",
+    body = {"server_path": path, "filename": "proof.pdf", "category": list(_m_cats())[0], "subgroup": "Proofs",
             "related_action_ref": ref, "payment": payment, "sender_phone": sender}
     return client.post("/api/agent/file-doc", json=body, headers={"X-Internal-Key": key} if key else {})
 
@@ -3372,7 +3375,89 @@ class TestPaymentProofReviewFixes:
         assert _file_doc(path, sender="256700000001").json()["auto_closed"] is False
         assert fake.actions["KIM/01/26-1"]["status"] == "open"
 
-    def test_reopen_is_limited_to_a_week_and_to_a_recorded_auto_close(self):
-        src = open(os.path.join(_APP_ROOT, "main.py"), encoding="utf8").read()
-        rb = src[src.index("def internal_action_reopen"):][:3800]
-        assert "INTERVAL '7 days'" in rb and "auto_closed" in rb and "payment_proofs" in rb
+    def test_reopen_is_refused_after_a_week(self, proof_env):
+        fake, path = proof_env()
+        assert _file_doc(path).json()["auto_closed"] is True
+        fake.proof_age_days = 8
+        r = client.post("/api/internal/actions/reopen", json={"action_ref": "KIM/01/26-1", "by": "Alpha"}, headers={"X-Internal-Key": "k-test"})
+        assert r.status_code == 409 and fake.actions["KIM/01/26-1"]["status"] == "done"
+
+    # ---- second review round: each failing input must not close ----
+    def _vm(self, text, **raw):
+        import payment_proof as pp
+        f = dict(_PP_FACTS, amount_ugx=500000, date="2026-10-05")
+        f.update(raw)
+        return pp.validate_facts(f, text, today=_dt.date(2026, 10, 12), members=_PP_MEMBERS)
+
+    def test_a_member_the_document_never_prints_cannot_be_the_payer(self):
+        t = "Transfer successful. From: John Kato To: Bravo Kato UGX 500,000 05/10/2026 Ref: ABC123456"
+        assert self._vm(t, payer="Kato Alpha")["payer"] is None
+        assert self._vm("Transfer successful. From: Outsider To: Bravo UGX 500,000 for Alpha fees 05/10/2026 Ref: ABC123456", payer="Alpha")["payer"] is None
+
+    @pytest.mark.parametrize("text", [
+        "Transfer completed from Alpha to Bravo. Amount 200,000. Total balance forward UGX 500,000. 05/10/2026 Ref: ABC123456",
+        "Transfer completed from Alpha to Bravo. Amount 200,000. Avail Bal: UGX 500,000 05/10/2026 Ref: ABC123456",
+    ])
+    def test_a_balance_under_any_label_is_not_the_payment(self, text):
+        assert self._vm(text)["amount_ugx"] is None
+
+    @pytest.mark.parametrize("text", [
+        "Transaction could not be completed. Alpha to Bravo UGX 500,000 completed",
+        "Status: Refunded. Alpha to Bravo UGX 500,000 completed",
+        "Status: Incomplete. Alpha to Bravo UGX 500,000",
+        "Request submitted for approval. Alpha to Bravo UGX 500,000 completed",
+        "UGX 500,000 sent from Alpha to Bravo",
+    ])
+    def test_more_negated_or_non_final_statuses(self, text):
+        assert self._vm(text)["status"] == "unknown"
+
+    def test_a_document_printing_two_dates_gives_no_date(self):
+        t = "Transfer completed Alpha Bravo UGX 500,000 Txn date 05/08/2026. Printed 05/10/2026 Ref: ABC123456"
+        assert self._vm(t)["date"] is None
+
+    def test_a_reference_must_follow_a_label_and_contain_a_digit(self):
+        base = "Transfer successful. Alpha to Bravo UGX 500,000 05/10/2026 "
+        assert self._vm(base + "Ref ABC/123/456", reference="ABC/123/456")["reference"] == "ABC/123/456"
+        assert self._vm(base + "Ref: ABC123456", reference="Transfer")["reference"] is None
+        assert self._vm(base + "Narration ABC123456", reference="ABC123456")["reference"] is None
+
+    def test_no_reference_means_no_close(self):
+        import payment_proof as pp
+        facts = dict(_PP_FACTS, reference=None)
+        act = {"description": "Pay UGX 123,000", "assignee": "Alpha", "assignees": ["Alpha"], "status": "open",
+               "deadline": _dt.date(2026, 10, 10), "created_at": _dt.datetime(2026, 10, 1)}
+        r = pp.decide(facts, act, _PP_MEMBERS, {"sender_ok": True, "proof_used": False})
+        assert r["close"] is False and all(r["checks"].values())
+
+    def test_kinship_in_the_description_is_never_resolved_so_it_never_closes(self):
+        import payment_proof as pp
+        act = {"description": "Send Mum UGX 123,000 for fees", "assignee": "Alpha", "assignees": ["Alpha"], "status": "open",
+               "deadline": _dt.date(2026, 10, 10), "created_at": _dt.datetime(2026, 10, 1)}
+        r = pp.decide(_PP_FACTS, act, _PP_MEMBERS, {"sender_ok": True, "proof_used": False})
+        assert r["close"] is False and r["checks"]["recipient_ok"] is False
+
+    def test_an_unknown_co_assignee_makes_the_owner_unclear(self):
+        import payment_proof as pp
+        act = {"description": "Pay UGX 123,000", "assignee": "Alpha", "assignees": ["Alpha", "Uncle Bob"], "status": "open",
+               "deadline": _dt.date(2026, 10, 10), "created_at": _dt.datetime(2026, 10, 1)}
+        assert pp.decide(_PP_FACTS, act, _PP_MEMBERS, {"sender_ok": True, "proof_used": False})["close"] is False
+
+    def test_tomorrow_is_not_a_valid_proof_date(self):
+        import payment_proof as pp
+        v = pp.validate_facts({"status": "success", "amount_ugx": 500000, "date": "2026-10-13"},
+                              "Transfer successful UGX 500,000 13/10/2026", today=_dt.date(2026, 10, 12))
+        assert v["date"] is None
+
+    def test_the_guard_fails_closed_until_shared_phones_are_configured(self, proof_env, monkeypatch):
+        fake, path = proof_env()
+        monkeypatch.delenv("KIMFAM_SHARED_PHONES", raising=False)
+        assert _file_doc(path).json()["auto_closed"] is False
+        monkeypatch.setenv("KIMFAM_SHARED_PHONES", "0700 000 003")        # another number format: matched on the last nine digits
+        assert _file_doc(path, sender="256700000003").json()["auto_closed"] is False
+
+    def test_a_typed_document_is_filed_but_never_closes(self, proof_env):
+        fake, path = proof_env()
+        body = {"server_path": path, "filename": "proof.docx", "category": list(_m_cats())[0], "subgroup": "Proofs",
+                "related_action_ref": "KIM/01/26-1", "payment": _PP_FACTS, "sender_phone": "256700000001"}
+        d = client.post("/api/agent/file-doc", json=body, headers={"X-Internal-Key": "k-test"}).json()
+        assert "auto_closed" not in d and fake.actions["KIM/01/26-1"]["status"] == "open" and d["action_commented"] is True
