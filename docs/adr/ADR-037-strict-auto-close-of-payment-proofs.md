@@ -56,3 +56,13 @@ The first build trusted the model for payer, recipient and date, and a negated o
 - **Sender:** a post from a shared phone (env KIMFAM_SHARED_PHONES, one device used by several people) never auto-closes, even for an admin.
 - **Reopen** is allowed only within 7 days and only when payment_proofs recorded the auto-close, not merely because the last status change carries the auto-close author name.
 Residual risk, accepted: members are matched by first name, so an outsider who shares a member's first name and prints it on a proof can satisfy the payer or recipient check. The group announcement with its one-line reopen, and the sender and ownership checks, are the mitigation.
+
+## Amendment 2 (12 Oct 2026, second review round)
+- **Names:** the member a payer or recipient resolves to must be printed in the document by name, outside narration, purpose and "for ..." text. A model cannot add a member the document never prints.
+- **Amount:** comma grouped figures printed without a currency count too, and balance, fee, forward and similar labels exclude a figure for up to 60 characters. Two different payment figures mean no close.
+- **Status:** negation within a few words of a success word, refunds, reversals, incomplete, submitted, initiated, expired and void all mean not success; a bare "sent" is no longer a success word.
+- **Date:** the document must print exactly one date and it must be the proof date. Numeric dates are read day first (the local convention); a month-first document from a foreign bank is an accepted residual risk.
+- **Reference:** a transaction reference printed after a Ref, Transaction or ID label (with at least one digit) is mandatory for a close and is the second duplicate key next to the file hash.
+- **Kinship words** ("send Mum", "Dad") in an action description are never resolved to a member, so those actions never auto-close; an unknown co-assignee makes the owner unclear.
+- **PDF only:** a typed DOCX or XLSX can say anything, so it is filed and commented, never trusted. A typed PDF is still possible; the group announcement with its one-line reopen is the mitigation.
+- **Shared phones:** the guard fails closed until KIMFAM_SHARED_PHONES is set on the server (comma separated numbers, compared on the last nine digits).
