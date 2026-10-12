@@ -3158,7 +3158,7 @@ class TestPaymentProofAutoClose:
         assert "payer is the action owner" in u["text"] and len(fake.proofs) == 1
 
     @pytest.mark.parametrize("facts", [
-        {"status": "failed"}, {"amount_ugx": 123001}, {"payer": "Bravo Tester", "recipient": "Delta"},
+        {"status": "failed"}, {"amount_ugx": 123001}, {"payer": "Bravo Tester", "recipient": "Alpha Tester"},
         {"date": "2026-10-11"}, {"recipient": "Someone Else"},
     ])
     def test_each_rule_failing_alone_leaves_the_action_open_and_still_comments(self, proof_env, facts):
@@ -3282,7 +3282,7 @@ class TestPaymentProofClassify:
 
         async def model(prompt, model="haiku", timeout=40):
             return ('{"category": "' + _m_cats()[0] + '", "subgroup": "Proofs", "related_action_ref": null, "confidence": 0.9, "reason": "r", '
-                    '"payment": {"status": "success", "amount_ugx": 123000, "payer": "Alpha Tester", "recipient": "Bravo Tester", "date": "2026-10-10"}}')
+                    '"payment": {"status": "success", "amount_ugx": 123000, "payer": "Alpha Tester", "recipient": "Bravo Tester", "date": "2026-10-10", "reference": "TXN123456"}}')
 
         async def summ(label, text):
             return "s"
